@@ -7,6 +7,9 @@ export type Settings = {
   hotkeyStartStop: string
   hotkeyScreenshot: string
   quality: 'low' | 'medium' | 'high'
+  codec: 'vp9' | 'vp8' | 'auto'
+  frameRate: 15 | 30 | 60
+  outputFormat: 'webm' | 'mp4' | 'mkv'
 }
 
 const api = {
@@ -25,6 +28,12 @@ const api = {
     ipcRenderer.invoke('save-recording', buffer, filename),
   saveScreenshot: (buffer: ArrayBuffer, filename: string): Promise<string> =>
     ipcRenderer.invoke('save-screenshot', buffer, filename),
+  convertRecording: (sourcePath: string, outputPath: string, format: string): Promise<string> =>
+    ipcRenderer.invoke('convert-recording', sourcePath, outputPath, format),
+
+  // FIX: Reads the save directory and returns all video/screenshot files,
+  // newest first. Used on mount to restore the file list across restarts.
+  listSavedFiles: (): Promise<string[]> => ipcRenderer.invoke('list-saved-files'),
 
   // Window controls
   minimize: () => ipcRenderer.invoke('window-minimize'),

@@ -8,14 +8,45 @@ export type CaptureSource = {
   thumbnail: string
 }
 
+export type Codec = 'vp9' | 'vp8' | 'auto'
+export type FrameRate = 15 | 30 | 60
+export type OutputFormat = 'webm' | 'mp4' | 'mkv'
+
 const QUALITY_CONSTRAINTS: Record<string, number> = {
-  low: 2_000_000,
-  medium: 8_000_000,
-  high: 20_000_000
+  low: 3_000_000,
+  medium: 6_000_000,
+  high: 10_000_000
+}
+
+const CODEC_MIME: Record<Codec, string[]> = {
+  vp9: ['video/webm;codecs=vp9', 'video/webm'],
+  vp8: ['video/webm;codecs=vp8', 'video/webm'],
+  auto: [
+    'video/webm;codecs=h264',
+    'video/mp4;codecs=h264',
+    'video/webm;codecs=vp9',
+    'video/webm;codecs=vp8',
+    'video/webm'
+  ]
+}
+
+function resolveMimeType(codec: Codec): string {
+  const types = CODEC_MIME[codec]
+
+  for (const mime of types) {
+    if (MediaRecorder.isTypeSupported(mime)) {
+      console.log('[capture] Using MIME type:', mime)
+      return mime
+    }
+  }
+
+  console.warn('[capture] No preferred MIME type supported, falling back to video/webm')
+  return 'video/webm'
 }
 
 function timestamp(): string {
   const d = new Date()
+
   return [
     d.getFullYear(),
     String(d.getMonth() + 1).padStart(2, '0'),
@@ -31,13 +62,17 @@ export const useCapture = () => {
   const [state, setState] = useState<RecordingState>('idle')
   const [sources, setSources] = useState<CaptureSource[]>([])
   const [selectedSource, setSelectedSource] = useState<CaptureSource | null>(null)
+
   const [bufferDuration, setBufferDurationState] = useState(300)
   const [quality, setQualityState] = useState<'low' | 'medium' | 'high'>('high')
+  const [codec, setCodecState] = useState<Codec>('auto')
+  const [frameRate, setFrameRateState] = useState<FrameRate>(60)
+  const [outputFormat, setOutputFormatState] = useState<OutputFormat>('mp4')
+
   const [savedFiles, setSavedFiles] = useState<string[]>([])
   const [error, setError] = useState<string | null>(null)
   const [recordingTime, setRecordingTime] = useState(0)
 
-  // Rolling buffer: array of { data: Blob, ts: number }
   const bufferRef = useRef<{ data: Blob; ts: number }[]>([])
   const recorderRef = useRef<MediaRecorder | null>(null)
   const streamRef = useRef<MediaStream | null>(null)
@@ -47,7 +82,27 @@ export const useCapture = () => {
 
   const clearError = (): void => setError(null)
 
-  // ── Load sources ─────────────────────────────────────────────────────────
+  /**
+   * Derive the full output path from the full webm path returned by
+   * saveRecording. Previously baseName had no directory component, so ffmpeg
+   * wrote the mp4 to the process working directory — then unlinkSync deleted
+   * the source webm, leaving both files in the wrong state.
+   */
+  const saveBlob = useCallback(
+    async (blob: Blob, baseName: string): Promise<string> => {
+      const arrayBuffer = await blob.arrayBuffer()
+      const webmPath = await window.api.saveRecording(arrayBuffer, `${baseName}.webm`)
+
+      if (outputFormat === 'webm') return webmPath
+
+      // Replace .webm extension on the full path — not the bare basename
+      const outputPath = webmPath.replace(/\.webm$/, `.${outputFormat}`)
+
+      return window.api.convertRecording(webmPath, outputPath, outputFormat)
+    },
+    [outputFormat]
+  )
+
   const refreshSources = useCallback(async () => {
     try {
       const mapped = await window.api.getSources()
@@ -58,96 +113,113 @@ export const useCapture = () => {
     }
   }, [selectedSource])
 
-  // ── Get media stream for a source ────────────────────────────────────────
+  /**
+   * Desktop audio requires chromeMediaSource: 'desktop' on the audio
+   * constraint — `audio: true` alone does not work for screen capture and
+   * will either error or record the wrong device.
+   */
   const getStream = useCallback(
     async (sourceId: string): Promise<MediaStream> => {
-      // Try progressively simpler constraints — Windows WGC can reject high-res requests
-      const attempts = [
+      const fps = frameRate
+
+      const attempts: object[] = [
         {
           chromeMediaSource: 'desktop',
           chromeMediaSourceId: sourceId,
-          minWidth: 1280,
-          maxWidth: 3840,
-          minHeight: 720,
-          maxHeight: 2160,
-          maxFrameRate: 60
+          width: 1920,
+          height: 1080,
+          maxFrameRate: fps
         },
         {
           chromeMediaSource: 'desktop',
           chromeMediaSourceId: sourceId,
-          maxWidth: 1920,
-          maxHeight: 1080,
+          width: 1280,
+          height: 720,
+          maxFrameRate: fps
+        },
+        {
+          chromeMediaSource: 'desktop',
+          chromeMediaSourceId: sourceId,
           maxFrameRate: 30
-        },
-        {
-          chromeMediaSource: 'desktop',
-          chromeMediaSourceId: sourceId
         }
       ]
 
       for (const mandatory of attempts) {
         try {
-          return await navigator.mediaDevices.getUserMedia({
-            audio: false,
-            video: { mandatory } as MediaTrackConstraints
+          const stream = await navigator.mediaDevices.getUserMedia({
+            audio: {
+              mandatory: {
+                chromeMediaSource: 'desktop'
+              }
+            } as MediaTrackConstraints,
+            video: {
+              mandatory
+            } as MediaTrackConstraints
           })
+
+          const settings = stream.getVideoTracks()[0]?.getSettings()
+          console.log('[capture] acquired stream:', settings)
+          console.log('[capture] audio tracks:', stream.getAudioTracks().length)
+
+          return stream
         } catch (e: unknown) {
-          console.warn('getUserMedia failed with constraints', mandatory, e)
-          // try next constraint set
+          console.warn('[capture] getUserMedia attempt failed:', mandatory, e)
         }
       }
-      throw new Error('Could not open capture stream. Try selecting a different source.')
+
+      throw new Error('Could not open capture stream. Try selecting another source.')
     },
-    [quality]
+    [frameRate]
   )
 
-  // ── Start rolling buffer ─────────────────────────────────────────────────
+  const makeRecorder = useCallback(
+    (stream: MediaStream): MediaRecorder => {
+      const mimeType = resolveMimeType(codec)
+
+      return new MediaRecorder(stream, {
+        mimeType,
+        videoBitsPerSecond: QUALITY_CONSTRAINTS[quality]
+      })
+    },
+    [codec, quality]
+  )
+
+  const trimBuffer = useCallback((cutoff: number) => {
+    while (bufferRef.current.length > 0 && bufferRef.current[0].ts <= cutoff) {
+      bufferRef.current.shift()
+    }
+  }, [])
+
   const startBuffer = useCallback(async () => {
     if (!selectedSource) {
       setError('No source selected')
       return
     }
+
     clearError()
 
     try {
       const stream = await getStream(selectedSource.id)
       streamRef.current = stream
 
-      const bitrate = QUALITY_CONSTRAINTS[quality]
-      const options: MediaRecorderOptions = {
-        mimeType: 'video/webm;codecs=vp9',
-        videoBitsPerSecond: bitrate
-      }
-
-      // Fallback if vp9 not supported
-      if (!MediaRecorder.isTypeSupported(options.mimeType!)) {
-        options.mimeType = 'video/webm;codecs=vp8'
-      }
-      if (!MediaRecorder.isTypeSupported(options.mimeType!)) {
-        options.mimeType = 'video/webm'
-      }
-
-      const recorder = new MediaRecorder(stream, options)
+      const recorder = makeRecorder(stream)
       recorderRef.current = recorder
       bufferRef.current = []
 
       recorder.ondataavailable = (e) => {
         if (e.data.size > 0) {
           bufferRef.current.push({ data: e.data, ts: Date.now() })
-          // Trim old chunks beyond buffer duration
-          const cutoff = Date.now() - bufferDuration * 1000
-          bufferRef.current = bufferRef.current.filter((c) => c.ts > cutoff)
+          trimBuffer(Date.now() - bufferDuration * 1000)
         }
       }
 
-      recorder.start(1000) // chunk every second
+      recorder.start(500)
       setState('buffering')
     } catch (e: unknown) {
       setError(`Failed to start capture: ${e?.['message'] || e}`)
     }
-  }, [selectedSource, quality, bufferDuration, getStream])
+  }, [selectedSource, bufferDuration, getStream, makeRecorder, trimBuffer])
 
-  // ── Stop everything ──────────────────────────────────────────────────────
   const stopAll = useCallback(() => {
     recorderRef.current?.stop()
     recorderRef.current = null
@@ -161,11 +233,9 @@ export const useCapture = () => {
     setState('idle')
   }, [])
 
-  // ── Save instant replay (last N seconds from buffer) ─────────────────────
   const saveReplay = useCallback(
     async (seconds?: number) => {
-      const duration = seconds ?? bufferDuration
-      const cutoff = Date.now() - duration * 1000
+      const cutoff = Date.now() - (seconds ?? bufferDuration) * 1000
       const chunks = bufferRef.current.filter((c) => c.ts > cutoff)
 
       if (chunks.length === 0) {
@@ -174,15 +244,13 @@ export const useCapture = () => {
       }
 
       setState('saving')
-      const blob = new Blob(
-        chunks.map((c) => c.data),
-        { type: 'video/webm' }
-      )
-      const arrayBuffer = await blob.arrayBuffer()
-      const filename = `replay_${timestamp()}.webm`
 
       try {
-        const path = await window.api.saveRecording(arrayBuffer, filename)
+        const blob = new Blob(
+          chunks.map((c) => c.data),
+          { type: 'video/webm' }
+        )
+        const path = await saveBlob(blob, `replay_${timestamp()}`)
         setSavedFiles((prev) => [path, ...prev])
       } catch (e: unknown) {
         setError(`Failed to save replay: ${e?.['message'] || e}`)
@@ -190,49 +258,43 @@ export const useCapture = () => {
 
       setState(recorderRef.current ? 'buffering' : 'idle')
     },
-    [bufferDuration]
+    [bufferDuration, saveBlob]
   )
 
-  // ── Manual start recording ───────────────────────────────────────────────
   const startRecording = useCallback(async () => {
     if (!selectedSource) {
       setError('No source selected')
       return
     }
 
-    // If already buffering, switch recorder to manual mode
     if (state === 'buffering' && recorderRef.current) {
       recordingChunksRef.current = [...bufferRef.current.map((c) => c.data)]
+
       recorderRef.current.ondataavailable = (e) => {
         if (e.data.size > 0) {
-          bufferRef.current.push({ data: e.data, ts: Date.now() })
+          const chunk = { data: e.data, ts: Date.now() }
+          bufferRef.current.push(chunk)
           recordingChunksRef.current.push(e.data)
-          const cutoff = Date.now() - bufferDuration * 1000
-          bufferRef.current = bufferRef.current.filter((c) => c.ts > cutoff)
+          trimBuffer(Date.now() - bufferDuration * 1000)
         }
       }
+
       startTimeRef.current = Date.now()
-      timerRef.current = setInterval(() => {
-        setRecordingTime(Math.floor((Date.now() - startTimeRef.current) / 1000))
-      }, 1000)
+      timerRef.current = setInterval(
+        () => setRecordingTime(Math.floor((Date.now() - startTimeRef.current) / 1000)),
+        1000
+      )
       setState('recording')
       return
     }
 
     clearError()
+
     try {
       const stream = await getStream(selectedSource.id)
       streamRef.current = stream
 
-      const bitrate = QUALITY_CONSTRAINTS[quality]
-      let mimeType = 'video/webm;codecs=vp9'
-      if (!MediaRecorder.isTypeSupported(mimeType)) mimeType = 'video/webm;codecs=vp8'
-      if (!MediaRecorder.isTypeSupported(mimeType)) mimeType = 'video/webm'
-
-      const recorder = new MediaRecorder(stream, {
-        mimeType,
-        videoBitsPerSecond: bitrate
-      })
+      const recorder = makeRecorder(stream)
       recorderRef.current = recorder
       recordingChunksRef.current = []
 
@@ -240,20 +302,22 @@ export const useCapture = () => {
         if (e.data.size > 0) recordingChunksRef.current.push(e.data)
       }
 
-      recorder.start(1000)
+      recorder.start(500)
+
       startTimeRef.current = Date.now()
-      timerRef.current = setInterval(() => {
-        setRecordingTime(Math.floor((Date.now() - startTimeRef.current) / 1000))
-      }, 1000)
+      timerRef.current = setInterval(
+        () => setRecordingTime(Math.floor((Date.now() - startTimeRef.current) / 1000)),
+        1000
+      )
       setState('recording')
     } catch (e: unknown) {
       setError(`Failed to start recording: ${e?.['message'] || e}`)
     }
-  }, [selectedSource, state, quality, bufferDuration, getStream])
+  }, [selectedSource, state, bufferDuration, getStream, makeRecorder, trimBuffer])
 
-  // ── Stop & save manual recording ─────────────────────────────────────────
   const stopRecording = useCallback(async () => {
     if (!recorderRef.current) return
+
     setState('saving')
     if (timerRef.current) clearInterval(timerRef.current)
 
@@ -262,47 +326,36 @@ export const useCapture = () => {
       recorderRef.current!.stop()
     })
 
-    const blob = new Blob(recordingChunksRef.current, { type: 'video/webm' })
-    const arrayBuffer = await blob.arrayBuffer()
-    const filename = `rec_${timestamp()}.webm`
-
     try {
-      const path = await window.api.saveRecording(arrayBuffer, filename)
+      const blob = new Blob(recordingChunksRef.current, { type: 'video/webm' })
+      const path = await saveBlob(blob, `rec_${timestamp()}`)
       setSavedFiles((prev) => [path, ...prev])
     } catch (e: unknown) {
       setError(`Failed to save: ${e?.['message'] || e}`)
     }
 
-    // Keep stream alive for continued buffering
     recordingChunksRef.current = []
-    if (streamRef.current) {
-      // Re-attach buffer recorder
-      const bitrate = QUALITY_CONSTRAINTS[quality]
-      let mimeType = 'video/webm;codecs=vp9'
-      if (!MediaRecorder.isTypeSupported(mimeType)) mimeType = 'video/webm;codecs=vp8'
-      if (!MediaRecorder.isTypeSupported(mimeType)) mimeType = 'video/webm'
 
-      const newRecorder = new MediaRecorder(streamRef.current, {
-        mimeType,
-        videoBitsPerSecond: bitrate
-      })
+    if (streamRef.current) {
+      const newRecorder = makeRecorder(streamRef.current)
       recorderRef.current = newRecorder
+
       newRecorder.ondataavailable = (e) => {
         if (e.data.size > 0) {
           bufferRef.current.push({ data: e.data, ts: Date.now() })
-          const cutoff = Date.now() - bufferDuration * 1000
-          bufferRef.current = bufferRef.current.filter((c) => c.ts > cutoff)
+          trimBuffer(Date.now() - bufferDuration * 1000)
         }
       }
-      newRecorder.start(1000)
+
+      newRecorder.start(500)
       setState('buffering')
     } else {
       setState('idle')
     }
-    setRecordingTime(0)
-  }, [quality, bufferDuration])
 
-  // ── Screenshot ───────────────────────────────────────────────────────────
+    setRecordingTime(0)
+  }, [makeRecorder, bufferDuration, saveBlob, trimBuffer])
+
   const takeScreenshot = useCallback(async () => {
     if (!selectedSource) {
       setError('No source selected')
@@ -319,40 +372,52 @@ export const useCapture = () => {
       }
 
       const track = stream.getVideoTracks()[0]
-      // @ts-ignore - ImageCapture may not be in all TS defs
-      const imageCapture = new ImageCapture(track)
-      const bitmap = await imageCapture.grabFrame()
 
+      // @ts-ignore
+      const bitmap = await new ImageCapture(track).grabFrame()
       const canvas = document.createElement('canvas')
       canvas.width = bitmap.width
       canvas.height = bitmap.height
-      const ctx = canvas.getContext('2d')!
-      ctx.drawImage(bitmap, 0, 0)
+      canvas.getContext('2d')!.drawImage(bitmap, 0, 0)
 
       const blob = await new Promise<Blob>((res) => canvas.toBlob((b) => res(b!), 'image/png'))
-      const arrayBuffer = await blob.arrayBuffer()
-      const filename = `screenshot_${timestamp()}.png`
-      const path = await window.api.saveScreenshot(arrayBuffer, filename)
-      setSavedFiles((prev) => [path, ...prev])
+      const path = await window.api.saveScreenshot(
+        await blob.arrayBuffer(),
+        `screenshot_${timestamp()}.png`
+      )
 
+      setSavedFiles((prev) => [path, ...prev])
       if (ownedStream) stream.getTracks().forEach((t) => t.stop())
     } catch (e: unknown) {
       setError(`Screenshot failed: ${e?.['message'] || e}`)
     }
   }, [selectedSource, getStream])
 
-  // ── Settings sync ────────────────────────────────────────────────────────
-  const updateBufferDuration = (v: number): void => {
+  const updateBufferDuration = (v: number) => {
     setBufferDurationState(v)
     window.api.saveSettings({ bufferDuration: v })
   }
 
-  const updateQuality = (v: 'low' | 'medium' | 'high'): void => {
+  const updateQuality = (v: 'low' | 'medium' | 'high') => {
     setQualityState(v)
     window.api.saveSettings({ quality: v })
   }
 
-  // ── Hotkey wiring ────────────────────────────────────────────────────────
+  const updateCodec = (v: Codec) => {
+    setCodecState(v)
+    window.api.saveSettings({ codec: v })
+  }
+
+  const updateFrameRate = (v: FrameRate) => {
+    setFrameRateState(v)
+    window.api.saveSettings({ frameRate: v })
+  }
+
+  const updateOutputFormat = (v: OutputFormat) => {
+    setOutputFormatState(v)
+    window.api.saveSettings({ outputFormat: v })
+  }
+
   useEffect(() => {
     const offReplay = window.api.onTriggerReplay(() => saveReplay())
     const offToggle = window.api.onTriggerToggleRecording(() => {
@@ -368,12 +433,15 @@ export const useCapture = () => {
     }
   }, [saveReplay, startRecording, stopRecording, takeScreenshot, state])
 
-  // Load settings on mount
   useEffect(() => {
     window.api.getSettings().then((s) => {
       setBufferDurationState(s.bufferDuration)
       setQualityState(s.quality)
+      if (s.codec) setCodecState(s.codec)
+      if (s.frameRate) setFrameRateState(s.frameRate)
+      if (s.outputFormat) setOutputFormatState(s.outputFormat)
     })
+    window.api.listSavedFiles().then(setSavedFiles)
     refreshSources()
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
@@ -387,6 +455,12 @@ export const useCapture = () => {
     updateBufferDuration,
     quality,
     updateQuality,
+    codec,
+    updateCodec,
+    frameRate,
+    updateFrameRate,
+    outputFormat,
+    updateOutputFormat,
     savedFiles,
     error,
     clearError,

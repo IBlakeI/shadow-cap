@@ -599,7 +599,11 @@ body {
   font-family: var(--mono);
 }
 
-/* Settings ───── */
+/* Settings */
+
+.settings-hint strong {
+  color: var(--text-dim);
+}
 
 .settings-panel {
   padding: 20px;
