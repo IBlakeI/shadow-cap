@@ -373,7 +373,6 @@ export const useCapture = () => {
 
       const track = stream.getVideoTracks()[0]
 
-      // @ts-ignore
       const bitmap = await new ImageCapture(track).grabFrame()
       const canvas = document.createElement('canvas')
       canvas.width = bitmap.width
@@ -434,15 +433,21 @@ export const useCapture = () => {
   }, [saveReplay, startRecording, stopRecording, takeScreenshot, state])
 
   useEffect(() => {
-    window.api.getSettings().then((s) => {
+    async function init() {
+      const s = await window.api.getSettings()
       setBufferDurationState(s.bufferDuration)
       setQualityState(s.quality)
       if (s.codec) setCodecState(s.codec)
       if (s.frameRate) setFrameRateState(s.frameRate)
       if (s.outputFormat) setOutputFormatState(s.outputFormat)
-    })
-    window.api.listSavedFiles().then(setSavedFiles)
-    refreshSources()
+
+      const files = await window.api.listSavedFiles()
+      setSavedFiles(files)
+
+      await refreshSources()
+    }
+
+    init()
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
